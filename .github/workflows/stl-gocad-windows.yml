@@ -1,0 +1,42 @@
+name: STL GoCAD - Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Baixar codigo do repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Conferir versao do compilador
+        shell: pwsh
+        run: rustc --version
+
+      - name: Compilar SolidCraft modificado
+        shell: pwsh
+        run: cargo build --release --locked -p solidcraft
+
+      - name: Preparar executavel
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path pacote
+          Copy-Item target/release/solidcraft.exe pacote/solidcraft.exe
+          Copy-Item LICENSE-MIT, LICENSE-APACHE, NOTICE -Destination pacote
+
+      - name: Disponibilizar download
+        uses: actions/upload-artifact@v4
+        with:
+          name: STL-GoCAD-Windows-teste
+          path: pacote/
+          if-no-files-found: error
+          retention-days: 7
