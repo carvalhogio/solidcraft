@@ -222,7 +222,7 @@ pub struct Camera {
     pub target: Vec3,
     /// Rotation about Z; 0 = looking along +Y (from the front).
     pub yaw: f64,
-    /// Elevation above the XY plane, in (−π/2, π/2].
+    /// Elevation above the XY plane; full rotations are supported.
     pub pitch: f64,
     /// Rotation about the viewing direction. Zero keeps the world's up axis vertical.
     #[serde(default)]
@@ -349,9 +349,10 @@ impl Camera {
     /// Orbit by pixel deltas. The model follows the cursor: dragging right turns the side
     /// facing the viewer to the right.
     pub fn orbit(&mut self, dx: f64, dy: f64) {
-        let lim = std::f64::consts::FRAC_PI_2 - 1e-4;
-        self.yaw = (self.yaw + dx * 0.008) % std::f64::consts::TAU;
-        self.pitch = (self.pitch + dy * 0.008).clamp(-lim, lim);
+        if dx.is_finite() && dy.is_finite() {
+            self.yaw = (self.yaw + dx * 0.008).rem_euclid(std::f64::consts::TAU);
+            self.pitch = (self.pitch + dy * 0.008).rem_euclid(std::f64::consts::TAU);
+        }
     }
     /// Rotate the image about the viewing direction.
     pub fn roll_by(&mut self, radians: f64) {
