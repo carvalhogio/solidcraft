@@ -21,7 +21,7 @@ fn navigate(_s: &mut Session, p: &Value) -> Result<Value> {
         || !(0.0..std::f64::consts::PI).contains(&cam.fov)
         || cam.yaw.abs() > 1e6
         || cam.roll.abs() > 1e6
-        || cam.pitch.abs() > std::f64::consts::FRAC_PI_2
+        || cam.pitch.abs() > std::f64::consts::TAU
     {
         return Err(bad(cmd, "invalid camera"));
     }
@@ -141,6 +141,20 @@ mod tests {
     use super::*;
     use solidcraft_geom::Vec3;
     use solidcraft_render::UpAxis;
+
+    /// Free vertical orbit can pass the poles, and the view cube must remain usable.
+    #[test]
+    fn navigation_accepts_camera_after_complete_vertical_orbits() {
+        let mut session = Session::default();
+        let mut camera = Camera::default();
+        camera.set_view(StandardView::Front);
+        camera.orbit(0.0, 300.0); // 2.4 radians, beyond the former +/-90 degree cap
+        assert!(camera.pitch.abs() > std::f64::consts::FRAC_PI_2);
+        let input = json!({"camera": camera, "action": "home"});
+        let result = navigate(&mut session, &input).expect("home should work after vertical orbit");
+        let reset: Camera = serde_json::from_value(result["camera"].clone()).unwrap();
+        assert!(reset.is_valid());
+    }
 
     /// #1541: left, right, up and down turn a quarter turn, or `degrees` (the arrow keys' 15°).
     #[test]
