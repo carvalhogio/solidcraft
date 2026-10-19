@@ -21,7 +21,7 @@ fn navigate(_s: &mut Session, p: &Value) -> Result<Value> {
         || !(0.0..std::f64::consts::PI).contains(&cam.fov)
         || cam.yaw.abs() > 1e6
         || cam.roll.abs() > 1e6
-        || cam.pitch.abs() > std::f64::consts::TAU
+        || cam.pitch.abs() > 1e6
     {
         return Err(bad(cmd, "invalid camera"));
     }
@@ -52,12 +52,14 @@ fn navigate(_s: &mut Session, p: &Value) -> Result<Value> {
                 .map(|d| if d == 90.0 { (1.0, 0.0) } else { d.to_radians().sin_cos() })
                 .ok_or_else(|| bad(cmd, "degrees must be a number above 0 and at most 180"))?,
         };
-        let turn = |toward: solidcraft_geom::Vec3| cam.looking_from(b * cos + toward * sin);
+        // Rotate the whole camera frame, not just its viewing direction.
+        // Keeping the frame's right vector prevents an upside-down camera from
+        // unexpectedly snapping to the opposite heading or rolling the cube.
         match p.get("action").and_then(Value::as_str) {
-            Some("left") => cam = turn(-r),
-            Some("right") => cam = turn(r),
-            Some("up") => cam = turn(u),
-            Some("down") => cam = turn(-u),
+            Some("left") => cam = cam.looking_from_oriented(b * cos - r * sin, r * cos + b * sin),
+            Some("right") => cam = cam.looking_from_oriented(b * cos + r * sin, r * cos - b * sin),
+            Some("up") => cam = cam.looking_from_oriented(b * cos + u * sin, r),
+            Some("down") => cam = cam.looking_from_oriented(b * cos - u * sin, r),
             Some("clockwise") => cam.roll = (cam.roll + FRAC_PI_2).rem_euclid(std::f64::consts::TAU),
             Some("counterclockwise") => cam.roll = (cam.roll - FRAC_PI_2).rem_euclid(std::f64::consts::TAU),
             Some("home") => {
@@ -141,6 +143,33 @@ mod tests {
     use super::*;
     use solidcraft_geom::Vec3;
     use solidcraft_render::UpAxis;
+
+    /// Every arrow takes the requested direction even after the camera crosses a pole.
+    #[test]
+    fn cube_arrows_keep_continuous_orientation_after_vertical_loops() {
+        let mut session = Session::default();
+        let mut cam = Camera::default();
+        cam.set_view(StandardView::Front);
+        cam.orbit(0.0, 270.0); // > 90 degrees, upside down
+        for action in ["right", "up", "left", "down", "right", "right", "up"] {
+            let (right, up, back) = cam.basis();
+            let result = navigate(&mut session, &json!({"camera":cam,"action":action})).unwrap();
+            let next: Camera = serde_json::from_value(result["camera"].clone()).unwrap();
+            let expected = match action {
+                "right" => right,
+                "left" => -right,
+                "up" => up,
+                _ => -up,
+            };
+            assert!(next.back().dist(expected) < 1e-8, "{action}: wrong direction");
+            assert!(next.basis().0.dot(right).abs() < 1e-8 || matches!(action, "up" | "down"), "{action}: unexpected roll");
+            for frame in 1..60 {
+                let halfway = Camera::interpolate(&cam, &next, frame as f64 / 60.0);
+                assert!(halfway.is_valid() && halfway.basis().0.is_finite());
+            }
+            cam = next;
+        }
+    }
 
     /// Free vertical orbit can pass the poles, and the view cube must remain usable.
     #[test]
