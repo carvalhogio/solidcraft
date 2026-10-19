@@ -166,8 +166,9 @@ impl CameraAnim {
     /// A view change: half a second, longer for turns past a quarter turn (so a big turn, such
     /// as from the home view to the bottom, never sweeps more than about 9 degrees a frame).
     pub fn new(from: Camera, to: Camera, now: f64) -> CameraAnim {
-        let dy = (to.yaw - from.yaw + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
-        let turn = dy.abs().max((to.pitch - from.pitch).abs());
+        // Measure the real 3D change, not separate Euler-angle differences.
+        let dot = from.orientation().dot(to.orientation()).abs().clamp(0.0, 1.0);
+        let turn = 2.0 * dot.acos();
         let k = if turn.is_finite() { (turn / std::f64::consts::FRAC_PI_2).clamp(1.0, 2.0) } else { 1.0 };
         CameraAnim { from, to, start: now, duration: CameraAnim::DURATION * k }
     }
@@ -390,33 +391,58 @@ impl Camera {
         };
         Camera { yaw, pitch, roll: 0.0, ..*self }
     }
+    /// Reconstruct a camera from an oriented frame without losing the image's right vector.
+    /// Unlike `looking_from`, this preserves roll and can represent upside-down views.
+    pub fn looking_from_oriented(&self, back: Vec3, right: Vec3) -> Camera {
+        use std::f64::consts::{PI, TAU};
+        let Some(b) = self.to_frame(back).normalized() else { return *self };
+        let Some(r) = self.to_frame(right).normalized() else { return *self };
+        if b.dot(r).abs() > 1e-5 { return *self; }
+        // Both Euler branches encode the same direction. Keep the one closest
+        // to the present view so a turn across a pole does not flip the cube.
+        let pitch = b.z.clamp(-1.0, 1.0).asin();
+        let yaw = if b.x.hypot(b.y) < 1e-9 { self.yaw } else { (-b.x).atan2(-b.y) };
+        let nearest = |value: f64, reference: f64| {
+            reference + (value - reference + PI).rem_euclid(TAU) - PI
+        };
+        let mut chosen = *self;
+        let mut best = f64::INFINITY;
+        for (base_yaw, base_pitch) in [(yaw, pitch), (yaw + PI, PI - pitch)] {
+            let y = nearest(base_yaw, self.yaw);
+            let p = nearest(base_pitch, self.pitch);
+            let right0 = Vec3::new(y.cos(), -y.sin(), 0.0);
+            let up0 = b.cross(right0);
+            let roll = nearest(r.dot(up0).atan2(r.dot(right0)), self.roll);
+            let cost = (p - self.pitch).abs() + (y - self.yaw).abs() + (roll - self.roll).abs();
+            if cost < best {
+                best = cost;
+                chosen.yaw = y;
+                chosen.pitch = p;
+                chosen.roll = roll;
+            }
+        }
+        chosen
+    }
+
     /// Orientation as a unit quaternion (camera → world rotation).
     pub fn orientation(&self) -> Quat {
         let (r, u, b) = self.basis();
         Quat::from_basis(r, u, b)
     }
-    /// Blend between two cameras at `s` in [0, 1]: heading and roll take the shorter way.
+    /// Blend camera orientations on the shortest spatial arc. Euler interpolation can
+    /// spin the navigation cube when a continuous vertical orbit crosses a pole.
     pub fn interpolate(a: &Camera, b: &Camera, s: f64) -> Camera {
-        if !(s > 0.0) {
-            return *a;
-        }
-        if s >= 1.0 {
-            return *b;
-        }
-        // Keep heading and elevation smooth near straight up or down. A quaternion slerp
-        // swings the heading sharply there when moving to Top.
-        let dy = (b.yaw - a.yaw + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
-        let yaw = a.yaw + dy * s;
-        let dr = (b.roll - a.roll + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
-        let pitch = a.pitch + (b.pitch - a.pitch) * s;
+        if !(s > 0.0) { return *a; }
+        if s >= 1.0 { return *b; }
+        let (right, _, back) = a.orientation().slerp(b.orientation(), s).basis();
+        // Preserve a consistent, screen-relative camera frame throughout the turn.
+        let oriented = a.looking_from_oriented(back, right);
         Camera {
             target: a.target + (b.target - a.target) * s,
-            yaw,
-            pitch,
-            roll: a.roll + dr * s,
             distance: a.distance + (b.distance - a.distance) * s,
             fov: a.fov + (b.fov - a.fov) * s,
-            up: b.up,
+            up: a.up,
+            ..oriented
         }
     }
     pub fn is_valid(&self) -> bool {
@@ -620,4 +646,28 @@ mod tests {
         let v = Vec3::new(1.0, 2.0, 3.0);
         assert!(UpAxis::Y.from_frame(UpAxis::Y.to_frame(v)).dist(v) < 1e-12);
     }
+    #[test]
+    fn interpolated_camera_follows_shortest_frame_turn_after_vertical_loops() {
+        let mut a = Camera::default();
+        a.set_view(StandardView::Front);
+        a.orbit(0.0, 430.0);
+        for delta in [std::f64::consts::FRAC_PI_2, -std::f64::consts::FRAC_PI_2] {
+            let (right, _, back) = a.basis();
+            let b = a.looking_from_oriented(back * delta.cos() + right * delta.sin(), right * delta.cos() - back * delta.sin());
+            let qa = a.orientation();
+            let qb = b.orientation();
+            let total = 2.0 * qa.dot(qb).abs().clamp(0.0, 1.0).acos();
+            assert!((total - std::f64::consts::FRAC_PI_2).abs() < 1e-7);
+            let mut prev = a;
+            for step in 1..=60 {
+                let frame = Camera::interpolate(&a, &b, step as f64 / 60.0);
+                let dot = prev.orientation().dot(frame.orientation()).abs().clamp(0.0, 1.0);
+                let angle = 2.0 * dot.acos();
+                assert!(frame.is_valid() && angle < 0.05, "frame {step}: jumped {angle}");
+                prev = frame;
+            }
+            a = b;
+        }
+    }
+
 }
