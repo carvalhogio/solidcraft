@@ -44,6 +44,8 @@ struct SavedCamera {
     fov: f64,
     #[serde(default)]
     up: UpAxis,
+    #[serde(default)]
+    free_orientation: Option<(solidcraft_render::Quat, [f64; 3])>,
 }
 
 impl Default for RenderSetup {
