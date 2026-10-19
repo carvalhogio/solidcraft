@@ -80,7 +80,7 @@ pub fn ease_in_out(t: f64) -> f64 {
 }
 
 /// A unit quaternion (w, x, y, z).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Quat {
     pub w: f64,
     pub x: f64,
@@ -235,43 +235,48 @@ pub struct Camera {
     /// The world's up axis.
     #[serde(default)]
     pub up: UpAxis,
+    /// Persistent 3D orientation. The reference angles detect legacy direct Euler edits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_orientation: Option<(Quat, [f64; 3])>,
 }
 
 impl Default for Camera {
     fn default() -> Self {
         let (yaw, pitch) = StandardView::Iso.angles();
-        Camera { target: Vec3::ZERO, yaw, pitch, roll: 0.0, distance: 200.0, fov: 0.0, up: UpAxis::Z }
+        Camera { target: Vec3::ZERO, yaw, pitch, roll: 0.0, distance: 200.0, fov: 0.0, up: UpAxis::Z, free_orientation: None }
     }
 }
 
 impl Camera {
+    /// Current rotation: quaternion survives poles and multiple complete revolutions.
+    /// Legacy callers which write yaw/pitch/roll directly automatically invalidate the cache.
+    pub fn free_basis(&self) -> Option<(Vec3, Vec3, Vec3)> {
+        self.free_orientation.and_then(|(q, angles)| {
+            (angles == [self.yaw, self.pitch, self.roll] && q.len().is_finite()
+                && (q.len() - 1.0).abs() < 1e-5).then(|| q.normalized().basis())
+        })
+    }
     /// Direction from the target toward the eye.
     pub fn back(&self) -> Vec3 {
-        let (cp, sp) = (self.pitch.cos(), self.pitch.sin());
-        self.up.from_frame(Vec3::new(-self.yaw.sin() * cp, -self.yaw.cos() * cp, sp).normalized().unwrap_or(Vec3::Z))
+        self.basis().2
     }
-    /// The world's up direction.
-    pub fn up_dir(&self) -> Vec3 {
-        self.up.dir()
-    }
-    /// A world vector in the camera's Z-up frame (where yaw and pitch are measured).
-    pub fn to_frame(&self, v: Vec3) -> Vec3 {
-        self.up.to_frame(v)
-    }
-    /// A Z-up frame vector in the world.
-    pub fn from_frame(&self, v: Vec3) -> Vec3 {
-        self.up.from_frame(v)
-    }
-    pub fn eye(&self) -> Vec3 {
-        self.target + self.back() * self.distance
-    }
-    /// Camera basis: right, up, back (orthonormal).
+    pub fn up_dir(&self) -> Vec3 { self.up.dir() }
+    pub fn to_frame(&self, v: Vec3) -> Vec3 { self.up.to_frame(v) }
+    pub fn from_frame(&self, v: Vec3) -> Vec3 { self.up.from_frame(v) }
+    pub fn eye(&self) -> Vec3 { self.target + self.back() * self.distance }
+    /// Camera-local right, up and back. The quaternion is authoritative for free orbit.
     pub fn basis(&self) -> (Vec3, Vec3, Vec3) {
-        let b = self.back();
+        if let Some((r, u, b)) = self.free_basis() { return (r, u, b); }
+        let (cp, sp) = (self.pitch.cos(), self.pitch.sin());
+        let b = self.up.from_frame(Vec3::new(-self.yaw.sin() * cp, -self.yaw.cos() * cp, sp).normalized().unwrap_or(Vec3::Z));
         let right = self.up.from_frame(Vec3::new(self.yaw.cos(), -self.yaw.sin(), 0.0));
         let up = b.cross(right).normalized().unwrap_or(self.up.dir());
         let (s, c) = self.roll.sin_cos();
         (right * c + up * s, up * c - right * s, b)
+    }
+    fn store_basis(&mut self, right: Vec3, up: Vec3, back: Vec3) {
+        let q = Quat::from_basis(right, up, back);
+        self.free_orientation = Some((q, [self.yaw, self.pitch, self.roll]));
     }
     pub fn view(&self) -> Mat4 {
         let (r, u, b) = self.basis();
@@ -347,18 +352,28 @@ impl Camera {
         let k = 2.0 * self.half_height() / h.max(1.0);
         self.target = self.target - r * (dx * k) + u * (dy * k);
     }
-    /// Orbit by pixel deltas. The model follows the cursor: dragging right turns the side
-    /// facing the viewer to the right.
+    /// True free orbit about the camera's current axes. Never decodes into Euler
+    /// angles between drags, so Top/Bottom and 360-degree crossings cannot gimbal-lock.
     pub fn orbit(&mut self, dx: f64, dy: f64) {
-        if dx.is_finite() && dy.is_finite() {
-            self.yaw = (self.yaw + dx * 0.008).rem_euclid(std::f64::consts::TAU);
-            self.pitch = (self.pitch + dy * 0.008).rem_euclid(std::f64::consts::TAU);
-        }
+        if !dx.is_finite() || !dy.is_finite() { return; }
+        let (mut right, mut up, mut back) = self.basis();
+        let (s, c) = (dx * 0.008).sin_cos();
+        let nb = back * c - right * s;
+        right = right * c + back * s;
+        back = nb;
+        let (s, c) = (dy * 0.008).sin_cos();
+        let nb = back * c + up * s;
+        up = up * c - back * s;
+        back = nb;
+        self.store_basis(right, up, back);
     }
     /// Rotate the image about the viewing direction.
     pub fn roll_by(&mut self, radians: f64) {
         if radians.is_finite() {
+            let (r, u, b) = self.basis();
             self.roll = (self.roll + radians) % std::f64::consts::TAU;
+            let (s, c) = radians.sin_cos();
+            self.store_basis(r * c + u * s, u * c - r * s, b);
         }
     }
     pub fn set_view(&mut self, v: StandardView) {
@@ -367,6 +382,7 @@ impl Camera {
         self.yaw = y;
         self.pitch = p.clamp(-lim, lim);
         self.roll = 0.0;
+        self.free_orientation = None;
     }
     /// Frame a bounding box.
     pub fn fit(&mut self, b: &Aabb3) {
@@ -389,7 +405,7 @@ impl Camera {
         } else {
             (-b.x).atan2(-b.y)
         };
-        Camera { yaw, pitch, roll: 0.0, ..*self }
+        Camera { yaw, pitch, roll: 0.0, free_orientation: None, ..*self }
     }
     /// Reconstruct a camera from an oriented frame without losing the image's right vector.
     /// Unlike `looking_from`, this preserves roll and can represent upside-down views.
@@ -421,6 +437,11 @@ impl Camera {
                 chosen.roll = roll;
             }
         }
+        // Retain the EXACT requested frame. The Euler angles are only for legacy APIs.
+        // An oriented cube move must not lose its handedness at a pole.
+        let right_world = self.from_frame(r);
+        let up_world = back.cross(right_world).normalized().unwrap_or(self.up.dir());
+        chosen.store_basis(right_world, up_world, back);
         chosen
     }
 
@@ -452,6 +473,7 @@ impl Camera {
             && self.roll.is_finite()
             && self.distance.is_finite()
             && self.distance > 0.0
+            && self.free_orientation.is_none_or(|(q, _)| q.len().is_finite() && q.len() > 0.0)
     }
 }
 
@@ -472,6 +494,57 @@ mod tests {
         let (o, d) = c.ray(400.0, 300.0, 800.0, 600.0);
         assert!(d.dist(Vec3::Y) < 1e-9, "{d:?}");
         assert!((o - c.target).cross(d).len() < 1e-6);
+    }
+
+    /// Top and Bottom must BOTH tumble right when dragged right, not spin in-plane.
+    #[test]
+    fn orbit_uses_screen_axes_at_top_and_bottom() {
+        for view in [StandardView::Top, StandardView::Bottom] {
+            let mut c = Camera::default();
+            c.set_view(view);
+            let (right, _, before) = c.basis();
+            c.orbit(30.0, 0.0);
+            let expected = before * (30.0_f64 * 0.008).cos()
+                - right * (30.0_f64 * 0.008).sin();
+            assert!(c.back().dist(expected) < 1e-7, "{view:?}: horizontal orbit must tumble");
+            assert!(c.basis().0.dist(right * (30.0_f64 * 0.008).cos() + before * (30.0_f64 * 0.008).sin()) < 1e-7);
+            assert!(c.is_valid());
+        }
+    }
+
+    /// Alternating drags use the current camera frame without changing handedness.
+    #[test]
+    fn orbit_preserves_frame_and_continues_after_many_loops() {
+        let mut c = Camera::default();
+        c.set_view(StandardView::Front);
+        for _ in 0..250 {
+            let (r, u, b) = c.basis();
+            c.orbit(13.0, -17.0);
+            let (r2, u2, b2) = c.basis();
+            assert!(c.is_valid());
+            assert!(r2.dot(u2).abs() < 1e-8 && u2.dot(b2).abs() < 1e-8 && r2.dot(b2).abs() < 1e-8);
+            assert!(r2.cross(u2).dot(b2) > 1.0 - 1e-7);
+            assert!(r2.dot(r) > 0.95 && u2.dot(u) > 0.95 && b2.dot(b) > 0.95,
+                "unexpected rotation jump");
+        }
+    }
+
+    #[test]
+    fn v5_multiple_full_turns_without_direction_reversal() {
+        for view in [StandardView::Front, StandardView::Top, StandardView::Bottom] {
+            let mut c = Camera::default();
+            c.set_view(view);
+            for _ in 0..500 {
+                let (r, u, b) = c.basis();
+                c.orbit(16.0, -10.0);
+                let (nr, nu, nb) = c.basis();
+                assert!(c.is_valid() && nr.cross(nu).dot(nb) > 1.0 - 1e-7);
+                assert!(nr.dot(r) > 0.9 && nu.dot(u) > 0.9 && nb.dot(b) > 0.9);
+                assert!(c.free_basis().is_some());
+            }
+            let restored: Camera = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+            assert!(restored.basis().0.dist(c.basis().0) < 1e-9);
+        }
     }
 
     #[test]
